@@ -20,6 +20,7 @@ Open http://localhost:5173. The API docs are at http://localhost:8000/docs. The 
 - Financial entity patterns (currency, percentages, dates and named metrics) with optional spaCy NER.
 - FastAPI endpoints for ingestion, listing, search, extraction and retrieval evaluation.
 - Human-labeled retrieval benchmark with Precision@K, Recall@K, MRR, Hit Rate@K and mean latency.
+- Content-hash idempotency, extraction quality checks, bounded processing retries, resilient SEC HTTP retries, and per-stage ingestion lineage.
 
 SEC automated requests require a declared User-Agent and fair access. This is a personal project, so `SEC_USER_AGENT` should identify Folio and use a monitored contact email; no organization is needed. Do not put a personal email in `.env.example` or commit it. Copy the example to `.env`, add your contact email there, and start Docker. The downloader serializes SEC requests and applies a conservative delay.
 
@@ -32,6 +33,7 @@ SEC automated requests require a declared User-Agent and fair access. This is a 
 - `POST /entities/extract` — `{ "text": "..." }`
 - `POST /evaluation/benchmarks` — save a relevant passage for the current question
 - `GET /evaluation/benchmarks` and `POST /evaluation/run?top_k=5`
+- `GET /data-health` — ingestion counts, quality warnings, retry and failure totals, recent lineage events
 - `GET /health`
 
 ## Project layout

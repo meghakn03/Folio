@@ -1,11 +1,11 @@
-import hashlib, uuid, time
+import hashlib, uuid, time, threading
 from pathlib import Path
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from .config import RAW_DIR
-from .store import init_db, add_document, documents, get_document, all_chunks, add_benchmark_item, benchmark_items
-from .pipeline import extract_file, split_chunks, digest
+from .store import init_db, add_document, documents, get_document, all_chunks, add_benchmark_item, benchmark_items, find_document_by_hash, log_ingestion_event, data_health
+from .pipeline import extract_file, split_chunks, digest, quality_report, QualityError
 from .embeddings import vectors, rank
 from .entities import extract as extract_entities
 from . import sec
@@ -20,16 +20,55 @@ class EntityRequest(BaseModel): text:str=Field(min_length=1,max_length=100000)
 class BenchmarkRequest(BaseModel): query:str=Field(min_length=2,max_length=1000); relevant_chunk_id:str; ticker:str|None=None; form:str|None=None
 class SecRequest(BaseModel): ticker:str=Field(min_length=1,max_length=10); forms:list[str]=["10-K","10-Q"]; limit:int=Field(default=3,ge=1,le=10)
 
+_ingest_lock=threading.Lock()
+
 def ingest(path,doc):
-    doc_id=doc.get("id") or digest(doc.get("source",str(path)))
-    doc["id"]=doc_id
-    pages=extract_file(path); chunks=split_chunks(pages,doc_id)
-    for chunk,embedding in zip(chunks,vectors([c["text"] for c in chunks])): chunk["embedding"]=embedding
-    add_document(doc,chunks)
-    return {"document_id":doc_id,"chunks":len(chunks),"filename":doc.get("filename")}
+    # Keep duplicate detection and indexing atomic between concurrent local uploads.
+    with _ingest_lock:
+        return _ingest_serial(path,doc)
+
+def _ingest_serial(path,doc):
+    raw=path.read_bytes()
+    content_hash=hashlib.sha256(raw).hexdigest()
+    filename=doc.get("filename") or path.name
+    source=doc.get("source") or "upload"
+    existing=find_document_by_hash(content_hash)
+    if existing:
+        chunk_count=len(existing.get("chunks",[])) if "chunks" in existing else next((d["chunk_count"] for d in documents() if d["id"]==existing["id"]),0)
+        log_ingestion_event(existing["id"],source,filename,content_hash,"dedupe","duplicate",chunk_count=chunk_count)
+        return {"document_id":existing["id"],"chunks":chunk_count,"filename":existing.get("filename"),"status":"already indexed","content_hash":content_hash}
+    doc_id=doc.get("id") or content_hash
+    doc.update({"id":doc_id,"content_hash":content_hash})
+    attempts=3
+    for attempt in range(1,attempts+1):
+        try:
+            log_ingestion_event(doc_id,source,filename,content_hash,"received","started",attempt)
+            pages=extract_file(path)
+            chunks=split_chunks(pages,doc_id)
+            quality=quality_report(pages,chunks,len(raw))
+            quality_status="warning" if quality["warnings"] else "ok"
+            log_ingestion_event(doc_id,source,filename,content_hash,"extraction","complete",attempt,len(chunks),quality)
+            log_ingestion_event(doc_id,source,filename,content_hash,"chunking","complete",attempt,len(chunks),quality)
+            embedded=vectors([c["text"] for c in chunks])
+            for chunk,embedding in zip(chunks,embedded): chunk["embedding"]=embedding
+            log_ingestion_event(doc_id,source,filename,content_hash,"embedding","complete",attempt,len(chunks),quality)
+            doc.update({"quality":quality,"quality_status":quality_status,"processing_attempts":attempt})
+            add_document(doc,chunks)
+            log_ingestion_event(doc_id,source,filename,content_hash,"indexing","complete",attempt,len(chunks),quality)
+            return {"document_id":doc_id,"chunks":len(chunks),"filename":filename,"status":"ingested","content_hash":content_hash,"quality":quality}
+        except Exception as exc:
+            log_ingestion_event(doc_id,source,filename,content_hash,"processing","failed",attempt,error=f"{type(exc).__name__}: {exc}")
+            retryable=not isinstance(exc,(QualityError,ValueError))
+            if attempt>=attempts or not retryable: raise
+            log_ingestion_event(doc_id,source,filename,content_hash,"processing","retrying",attempt,error=f"{type(exc).__name__}: {exc}")
+            time.sleep(0.5*(2**(attempt-1)))
+    raise RuntimeError("Ingestion exhausted retries")
 
 @app.get("/health")
 def health(): return {"status":"ok","documents":len(documents())}
+
+@app.get("/data-health")
+def get_data_health(): return data_health()
 
 @app.get("/documents")
 def list_documents(): return documents()
@@ -48,24 +87,36 @@ async def ingest_upload(file:UploadFile=File(...),ticker:str|None=None,company:s
     if len(content)>50_000_000: raise HTTPException(413,"File exceeds 50 MB")
     path=RAW_DIR/f"{uuid.uuid4().hex}{suffix}"; path.write_bytes(content)
     try: return ingest(path,{"ticker":ticker.upper() if ticker else None,"company":company,"form":form,"filing_date":filing_date,"year":filing_date[:4] if filing_date else None,"source":"upload","filename":file.filename})
-    except Exception as e: raise HTTPException(422,f"Could not process filing: {e}")
+    except QualityError as e: raise HTTPException(422,f"Document failed quality checks: {e}")
+    except Exception as e: raise HTTPException(503,f"Could not process filing after retries: {e}")
 
 @app.post("/documents/ingest/sec")
 def ingest_sec(request:SecRequest):
     forms=[f for f in request.forms if f in {"10-K","10-Q"}]
     if not forms: raise HTTPException(400,"forms must contain 10-K or 10-Q")
     try: entries=sec.recent_filings(request.ticker,forms,request.limit)
-    except Exception as e: raise HTTPException(502,str(e))
+    except Exception as e:
+        log_ingestion_event(None,"sec_edgar",request.ticker,None,"sec_lookup","failed",error=f"{type(e).__name__}: {e}")
+        raise HTTPException(502,str(e))
     results=[]
     for item in entries:
         doc_id=digest(item["url"])
-        if get_document(doc_id): results.append({"document_id":doc_id,"chunks":0,"filename":item["filename"],"status":"already indexed"}); continue
+        indexed=get_document(doc_id)
+        if indexed:
+            log_ingestion_event(doc_id,item["url"],item["filename"],indexed.get("content_hash"),"dedupe","duplicate",chunk_count=len(indexed.get("chunks",[])))
+            results.append({"document_id":doc_id,"chunks":len(indexed.get("chunks",[])),"filename":item["filename"],"status":"already indexed"})
+            continue
         try:
             body=sec.download(item["url"])
+        except Exception as e:
+            log_ingestion_event(doc_id,item["url"],item["filename"],None,"sec_download","failed",attempt=6,error=f"{type(e).__name__}: {e}")
+            results.append({"filename":item["filename"],"status":"error","error":str(e)})
+            continue
+        try:
             suffix=Path(item["filename"]).suffix.lower() or ".html"
             path=RAW_DIR/f"{doc_id}{suffix}"; path.write_bytes(body)
             result=ingest(path,{"id":doc_id,"ticker":item["ticker"],"company":item["company"],"form":item["form"],"filing_date":item["filing_date"],"year":item["year"],"source":item["url"],"filename":item["filename"]})
-            results.append({**result,"status":"ingested"})
+            results.append(result)
         except Exception as e: results.append({"filename":item["filename"],"status":"error","error":str(e)})
     return {"ticker":request.ticker.upper(),"results":results}
 

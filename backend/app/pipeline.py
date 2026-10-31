@@ -40,3 +40,27 @@ def split_chunks(pages, doc_id):
     return result
 
 def digest(text): return hashlib.sha256(text.encode()).hexdigest()
+
+
+class QualityError(ValueError):
+    pass
+
+def quality_report(pages, chunks, raw_bytes):
+    page_count=len(pages)
+    text="\n".join(text for _,text in pages)
+    chars=len(text.strip())
+    chunk_count=len(chunks)
+    if page_count == 0: raise QualityError("No pages or HTML body were extracted")
+    if chars < 100: raise QualityError(f"Only {chars} text characters were extracted; document may be empty, scanned, or unreadable")
+    if chunk_count == 0: raise QualityError("No usable text chunks were produced")
+    unique=len({c["text"].strip() for c in chunks})
+    duplicate_ratio=1-(unique/chunk_count) if chunk_count else 0
+    avg_chars=round(sum(len(c["text"]) for c in chunks)/chunk_count,1)
+    warnings=[]
+    if chars < 1200: warnings.append("Low extracted text volume; verify this is a complete report.")
+    if duplicate_ratio >= 0.35: warnings.append("Many chunks repeat; review extraction and chunk boundaries.")
+    alpha=sum(ch.isalpha() for ch in text)
+    alpha_ratio=alpha/max(chars,1)
+    if alpha_ratio < 0.35: warnings.append("Low alphabetic text ratio; the source may be scanned or poorly encoded.")
+    if raw_bytes and chars/raw_bytes < 0.01: warnings.append("Very little text was recovered relative to file size; OCR may be needed.")
+    return {"page_count":page_count,"extracted_chars":chars,"chunk_count":chunk_count,"average_chunk_chars":avg_chars,"duplicate_chunk_ratio":round(duplicate_ratio,3),"alphabetic_ratio":round(alpha_ratio,3),"raw_bytes":raw_bytes,"warnings":warnings}
