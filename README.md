@@ -6,7 +6,7 @@ Local-first search and analysis for SEC filings. Upload a PDF/HTML filing or fet
 
 ```bash
 cp .env.example .env
-# .env.example includes a personal contact email; edit it if needed.
+# Replace the placeholder contact email in .env with an address you monitor before SEC downloads.
 docker compose up --build
 ```
 
@@ -21,7 +21,7 @@ Open http://localhost:5173. The API docs are at http://localhost:8000/docs. The 
 - FastAPI endpoints for ingestion, listing, search, extraction and retrieval evaluation.
 - Human-labeled retrieval benchmark with Precision@K, Recall@K, MRR, Hit Rate@K and mean latency.
 
-SEC automated requests require a declared User-Agent and fair access. This is a personal project, so `SEC_USER_AGENT` identifies Folio and provides a monitored contact email; no organization is needed. Copy `.env.example` to `.env` before starting Docker. The downloader serializes SEC requests and applies a conservative delay.
+SEC automated requests require a declared User-Agent and fair access. This is a personal project, so `SEC_USER_AGENT` should identify Folio and use a monitored contact email; no organization is needed. Do not put a personal email in `.env.example` or commit it. Copy the example to `.env`, add your contact email there, and start Docker. The downloader serializes SEC requests and applies a conservative delay.
 
 ## API
 
