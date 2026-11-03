@@ -1,3 +1,5 @@
+**Tech stack:** Python, FastAPI, React, Vite, SQLite, Sentence Transformers, FAISS, scikit-learn, Docker Compose
+
 # Folio — Financial Document Intelligence
 
 Local-first search and analysis for SEC filings. Upload a PDF/HTML filing or fetch recent 10-K/10-Q reports by ticker, then search with source passages, inspect financial entities, and track the indexed corpus.
